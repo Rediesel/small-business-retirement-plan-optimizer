@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Employer Retirement Plan Optimizer v1.0 - McConnell, Rothman &amp; Co.</title>
+
+  <!-- React 18 + ReactDOM (UMD, pinned - React 19+ has no UMD builds) -->
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel standalone (pinned): compiles the text/babel block in-browser -->
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+  <!-- Tailwind Play CDN: component uses Tailwind utility classes -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    body { margin: 0; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+const { useMemo, useState } = React;
+
+
+// McConnell, Rothman & Co. - Employer Retirement Plan Optimizer v1.0
+// Source guide: Employer Retirement Plan Guide v3.0 (Aug 2026)
+// Figures: 2026 limits per IRS Notice 2025-67 / IR-2025-111; costs per guide Section "Estimated Plan Costs"
+
+const BRAND = { burgundy: "#6B1F24", orange: "#E07D28", ink: "#2B2B2B", paper: "#FBF9F6", rule: "#E6DED6", soft: "#F3EDE6" };
+
+const L = {
+  deferral: 24500, catch50: 8000, catch60: 11250,
+  simpleDeferral: 17000, simpleCatch50: 4000, simpleCatch60: 5250,
+  c415: 72000, compCap: 360000, ssWageBase: 184500, hce: 160000, rothCatchWage: 150000, sepMinComp: 800,
+};
+
+const fmt = (n) => (n == null || isNaN(n) ? "-" : "$" + Math.round(n).toLocaleString());
+const pct = (n) => (n * 100).toFixed(1).replace(/\.0$/, "") + "%";
+
+// Self-employed compensation base: net profit less one-half SE tax (Pub. 560 method).
+// The 92.35% factor is used only to compute the SE tax itself.
+function seBase(netProfit) {
+  const nese = netProfit * 0.9235;
+  const oasdi = Math.min(nese, L.ssWageBase) * 0.124;
+  const medicare = nese * 0.029;
+  return Math.max(0, netProfit - (oasdi + medicare) / 2);
+}
+// Employer contribution for a self-employed owner at nominal rate r (circular calc): base x r / (1 + r)
+function seEmployer(netProfit, r) { return seBase(netProfit) * (r / (1 + r)); }
+
+function catchUp(age, simple) {
+  if (age >= 60 && age <= 63) return simple ? L.simpleCatch60 : L.catch60;
+  if (age >= 50) return simple ? L.simpleCatch50 : L.catch50;
+  return 0;
+}
+
+// ADP cap on HCE average given NHCE average deferral %
+function adpCap(nhce) {
+  if (nhce <= 0.02) return nhce * 2;
+  if (nhce <= 0.08) return nhce + 0.02;
+  return nhce * 1.25;
+}
+
+// Illustrative cash balance owner pay credit by age. Actuarially determined in practice; shown for sizing only.
+function cbEstimate(age, comp) {
+  const pts = [[35, 70000], [40, 95000], [45, 125000], [50, 165000], [55, 215000], [60, 270000], [65, 300000]];
+  let v;
+  if (age <= 35) v = pts[0][1];
+  else if (age >= 65) v = pts[pts.length - 1][1];
+  else {
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [a0, v0] = pts[i], [a1, v1] = pts[i + 1];
+      if (age >= a0 && age <= a1) { v = v0 + (v1 - v0) * ((age - a0) / (a1 - a0)); break; }
+    }
+  }
+  // A CB credit cannot sensibly exceed compensation
+  return Math.min(v, Math.min(comp, L.compCap) * 0.95);
+}
+
+// SECURE 2.0 s.45E startup credit (year 1). Admin credit: 100% of qualified costs up to $5,000 for <=50 EEs, 50% for 51-100.
+// Contribution credit (DC only): up to $1,000 per employee earning <=$100K, 100% in years 1-2, phased down for 51-100 EEs.
+function startupCredit(plan, ees, avgComp, eeContribPerHead, adminCost) {
+  if (ees < 1 || ees > 100) return { admin: 0, contrib: 0 };
+  const share = ees <= 50 ? 1 : 0.5;
+  const admin = Math.min(adminCost * share, 5000);
+  let contrib = 0;
+  if (plan !== "cb" && avgComp <= 100000 && eeContribPerHead > 0) {
+    const perEE = Math.min(1000, eeContribPerHead);
+    const phase = ees <= 50 ? 1 : Math.max(0, 1 - (ees - 50) * 0.02);
+    contrib = perEE * ees * phase;
+  }
+  return { admin: Math.round(admin), contrib: Math.round(contrib) };
+}
+
+const COST = {
+  sep:    { setup: [0, 25],      annual: [0, 0],        pp: [0, 0] },
+  simple: { setup: [0, 25],      annual: [0, 300],      pp: [0, 0] },
+  solo:   { setup: [0, 250],     annual: [0, 500],      pp: [0, 20] },
+  trad:   { setup: [500, 2000],  annual: [1500, 5000],  pp: [30, 75] },
+  sh:     { setup: [500, 2000],  annual: [2000, 6000],  pp: [30, 75] },
+  shps:   { setup: [750, 2500],  annual: [3500, 9500],  pp: [35, 80] },
+  cb:     { setup: [2000, 5000], annual: [2000, 10000], pp: [50, 100] },
+};
+
+const STATIC = {
+  sep:    { simplicity: 10, recruiting: 4, flexibility: 9, testing: "None", form5500: "None", roth: "Limited custodian support", loans: "No" },
+  simple: { simplicity: 8,  recruiting: 5, flexibility: 4, testing: "None", form5500: "None", roth: "Yes", loans: "No" },
+  solo:   { simplicity: 8,  recruiting: 0, flexibility: 9, testing: "None (owner/spouse only)", form5500: "5500-EZ over $250K assets", roth: "Yes (mega backdoor if document permits)", loans: "Yes" },
+  trad:   { simplicity: 4,  recruiting: 6, flexibility: 8, testing: "ADP/ACP annually; top-heavy", form5500: "Annual; audit at 100+", roth: "Yes", loans: "If plan permits" },
+  sh:     { simplicity: 5,  recruiting: 8, flexibility: 5, testing: "Exempt from ADP/ACP", form5500: "Annual; audit at 100+", roth: "Yes", loans: "If plan permits" },
+  shps:   { simplicity: 3,  recruiting: 8, flexibility: 5, testing: "ADP/ACP exempt; 401(a)(4) general test on PS", form5500: "Annual; audit at 100+", roth: "Yes", loans: "If plan permits" },
+  cb:     { simplicity: 1,  recruiting: 7, flexibility: 2, testing: "Combined-plan 401(a)(4); Schedule SB", form5500: "Annual + Schedule SB", roth: "401(k) side only", loans: "401(k) side only" },
+};
+
+const NAMES = {
+  sep: "SEP-IRA", simple: "SIMPLE IRA", solo: "Solo 401(k)", trad: "Traditional 401(k)",
+  sh: "Safe Harbor 401(k)", shps: "SH 401(k) + Cross-Tested PS", cb: "401(k) + Cash Balance",
+};
+
+const TODAY = new Date(2026, 8, 8);
+function daysUntil(d) { return Math.ceil((d - TODAY) / 86400000); }
+
+function RetirementPlanOptimizer() {
+  const [s, set] = useState({
+    entity: "scorp", ownerComp: 190000, ownerAge: 48, priorFicaWages: 150000,
+    employees: 6, eePayroll: 360000, participation: 60, avgDeferral: 4,
+    spouse: false, spouseComp: 60000,
+    fedRate: 32, ma: true, surtax: false,
+    stableProfit: true, related: false, newPlan: true,
+    tradMatch: "basic", shType: "ne",
+    wShelter: 4, wCost: 3, wSimplicity: 3, wRecruit: 2, wFlex: 2,
+  });
+  const [open, setOpen] = useState(null);
+  const u = (k) => (e) => {
+    const v = e.target.type === "checkbox" ? e.target.checked : e.target.type === "number" || e.target.type === "range" ? Number(e.target.value) : e.target.value;
+    set((p) => ({ ...p, [k]: v }));
+  };
+
+  const R = useMemo(() => {
+    const selfEmployed = s.entity === "sp" || s.entity === "partnership";
+    const comp = Math.min(s.ownerComp, L.compCap);
+    const ees = Math.max(0, s.employees);
+    const payroll = Math.max(0, s.eePayroll);
+    const avgComp = ees > 0 ? payroll / ees : 0;
+    const part = s.participation / 100, avgDef = s.avgDeferral / 100;
+    const nhceAvgDef = part * avgDef; // NHCE ADP including non-participants at 0%
+    const cu = catchUp(s.ownerAge, false), cuS = catchUp(s.ownerAge, true);
+    const maRate = s.ma ? 0.05 + (s.surtax ? 0.04 : 0) : 0;
+    const fed = s.fedRate / 100;
+    const ownerMAAllowed = !selfEmployed; // G.L. c. 62 s.2(d)(1)(D); DOR Directive 08-3
+    const ownerTaxRate = fed + (ownerMAAllowed ? maRate : 0);
+    const entityTaxRate = s.entity === "ccorp" ? 0.21 + (s.ma ? 0.08 : 0) : fed + maRate; // employee contributions always MA-deductible
+    const participants = ees + 1 + (s.spouse ? 1 : 0);
+    const rothCatchApplies = !selfEmployed && s.ownerAge >= 50 && s.priorFicaWages > L.rothCatchWage;
+
+    const ownerEmployerAt = (r) => selfEmployed ? seEmployer(s.ownerComp, r) : comp * r;
+    const spouseER = (r) => s.spouse ? Math.min(s.spouseComp, L.compCap) * r : 0;
+    const spouseDef = s.spouse ? Math.min(L.deferral, s.spouseComp) : 0;
+
+    const adminMid = (id) => {
+      const c = COST[id];
+      const mid = (a) => (a[0] + a[1]) / 2;
+      return { low: c.annual[0] + c.pp[0] * participants, high: c.annual[1] + c.pp[1] * participants, mid: mid(c.annual) + mid(c.pp) * participants, setup: mid(c.setup) };
+    };
+
+    const plans = [];
+
+    // SEP-IRA
+    {
+      const ownerER = Math.min(ownerEmployerAt(0.25), L.c415);
+      const effRate = selfEmployed ? (seBase(s.ownerComp) > 0 ? ownerER / s.ownerComp : 0) : ownerER / Math.max(comp, 1);
+      const uniformRate = selfEmployed ? 0.25 : Math.min(0.25, ownerER / Math.max(comp, 1)); // employees get the plan's nominal % of comp
+      const eeCost = payroll * uniformRate;
+      const a = adminMid("sep");
+      const credit = startupCredit("sep", ees, avgComp, ees ? eeCost / ees : 0, a.mid);
+      plans.push({
+        id: "sep", eligible: true,
+        ownerDeferral: 0, ownerER, ownerCatch: 0, ownerTotal: ownerER,
+        household: ownerER + spouseER(0.25),
+        eeCost, eeRate: uniformRate, a, credit,
+        maOwner: ownerMAAllowed, deadline: "Return due date + extensions (Oct 15, 2027 for 2026)", deadlineDays: null,
+        note: selfEmployed ? `Effective ~${pct(effRate)} of net profit after the circular calc` : `25% of W-2; ${fmt(288000)} of W-2 needed for the $72K maximum`,
+        pros: ["Zero admin, no Form 5500, no testing", "Most flexible deadline of any plan - can be set up after year-end", "Funding is fully discretionary year to year", "Immediate vesting is simple to communicate"],
+        cons: ["Owner cannot defer; capacity is employer-side only", "Uniform percentage: every eligible employee gets the owner's rate", "SEP balance poisons backdoor Roth pro-rata math (s.408(d)(2))", "No loans; Roth SEP custodian support still thin"],
+        best: "Owner-only or very few employees; simplicity over capacity",
+      });
+    }
+
+    // SIMPLE IRA
+    {
+      const eligible = ees <= 100 && !s.related;
+      const ownerDef = Math.min(L.simpleDeferral, selfEmployed ? s.ownerComp * 0.9235 : comp);
+      const matchBase = selfEmployed ? s.ownerComp * 0.9235 : comp;
+      const ownerER = Math.min(matchBase * 0.03, ownerDef);
+      const matchCost = payroll * Math.min(0.03, avgDef) * part;
+      const neCost = payroll * 0.02;
+      const useMatch = matchCost <= neCost;
+      const eeCost = Math.min(matchCost, neCost);
+      const a = adminMid("simple");
+      const credit = startupCredit("simple", ees, avgComp, ees ? eeCost / ees : 0, a.mid);
+      const oct1 = daysUntil(new Date(2026, 9, 1));
+      plans.push({
+        id: "simple", eligible, reason: !eligible ? (s.related ? "Related entities: cannot maintain SIMPLE alongside another plan in the group" : "More than 100 employees") : null,
+        ownerDeferral: ownerDef, ownerER, ownerCatch: cuS, ownerTotal: ownerDef + ownerER + cuS,
+        household: ownerDef + ownerER + cuS + (s.spouse ? Math.min(L.simpleDeferral, s.spouseComp) * 1 + Math.min(s.spouseComp * 0.03, L.simpleDeferral) : 0),
+        eeCost, eeRate: payroll ? eeCost / payroll : 0, a, credit,
+        maOwner: ownerMAAllowed, deadline: "Oct 1, 2026 for a 2026 plan", deadlineDays: oct1,
+        note: `${useMatch ? "3% match" : "2% nonelective"} is cheaper at ${s.participation}% participation / ${s.avgDeferral}% avg deferral`,
+        pros: ["Low cost, no testing, no Form 5500", "Employees can defer; employer cost is predictable and capped", "Match option can drop to 1% in 2 of any 5 years", "Roth available"],
+        cons: ["Owner deferral capped at $17,000 (+ $4,000 / $5,250 catch-up)", "Exclusive plan rule: no other plan in the controlled group", "Firm Oct 1 establishment deadline; no retroactive adoption", "25% early-withdrawal penalty in first 2 years; 2-year rollover lock"],
+        best: "2-100 employees, tight budget, owner not seeking maximum shelter",
+      });
+    }
+
+    // Solo 401(k)
+    {
+      const eligible = ees === 0;
+      const ownerDef = Math.min(L.deferral, selfEmployed ? seBase(s.ownerComp) : comp);
+      const er = ownerEmployerAt(0.25);
+      const ownerER = Math.max(0, Math.min(er, L.c415 - ownerDef));
+      const a = adminMid("solo");
+      const spouseTotal = s.spouse ? Math.min(L.c415, spouseDef + spouseER(0.25)) : 0;
+      plans.push({
+        id: "solo", eligible, reason: !eligible ? "Common-law employees disqualify an owner-only plan" : null,
+        ownerDeferral: ownerDef, ownerER, ownerCatch: cu, ownerTotal: ownerDef + ownerER + cu,
+        household: ownerDef + ownerER + cu + spouseTotal,
+        eeCost: 0, eeRate: 0, a, credit: { admin: 0, contrib: 0 },
+        maOwner: ownerMAAllowed,
+        deadline: selfEmployed ? "Deferral election by Dec 31 (first year: Apr 15, 2027 under SECURE 2.0 s.317)" : "Deferrals through payroll by Dec 31; employer side to filing deadline",
+        deadlineDays: daysUntil(new Date(2026, 11, 31)),
+        note: selfEmployed && s.entity === "sp" ? "Roth deferrals cost nothing extra at the MA level for a sole proprietor" : "Excluded from backdoor Roth pro-rata calc (not an IRA)",
+        pros: ["Deferral + employer side nearly doubles a SEP at moderate income", "Roth, loans, and mega backdoor Roth (if document permits)", "Not an IRA: clean backdoor Roth for high earners", "Spouse doubles capacity with no coverage testing"],
+        cons: ["Terminates or converts to a group plan on the first non-spouse hire", "5500-EZ once assets exceed $250K", "S-Corp deferrals must run through payroll during the year", "Prototype custodial plans often lack after-tax / in-plan conversion"],
+        best: "Owner-only (plus spouse); the default for self-employed clients",
+      });
+    }
+
+    // Traditional 401(k)
+    {
+      const cap = adpCap(nhceAvgDef);
+      const desiredPct = L.deferral / Math.max(comp, 1);
+      const allowedPct = ees > 0 ? Math.min(desiredPct, cap) : desiredPct;
+      const ownerDef = Math.min(L.deferral, allowedPct * (selfEmployed ? seBase(s.ownerComp) : comp));
+      const matchRate = s.tradMatch === "none" ? 0 : 0.03;
+      const ownerER = matchRate ? Math.min(ownerEmployerAt(matchRate), ownerDef) : 0;
+      const eeCost = s.tradMatch === "none" ? 0 : payroll * part * Math.min(matchRate, s.tradMatch === "basic" ? avgDef * 0.5 : avgDef);
+      const a = adminMid("trad");
+      const credit = startupCredit("trad", ees, avgComp, ees ? eeCost / ees : 0, a.mid);
+      const limited = ees > 0 && allowedPct < desiredPct;
+      plans.push({
+        id: "trad", eligible: true,
+        ownerDeferral: ownerDef, ownerER, ownerCatch: cu, ownerTotal: ownerDef + ownerER + cu,
+        household: ownerDef + ownerER + cu + (s.spouse ? Math.min(spouseDef, allowedPct * s.spouseComp) + Math.min(spouseER(matchRate), spouseDef) : 0),
+        eeCost, eeRate: payroll ? eeCost / payroll : 0, a, credit,
+        maOwner: ownerMAAllowed, deadline: "Dec 31, 2026 (deferrals prospective only)", deadlineDays: daysUntil(new Date(2026, 11, 31)),
+        testingRisk: ees === 0 ? "n/a" : limited ? "High" : nhceAvgDef < 0.05 ? "Medium" : "Low",
+        note: limited ? `ADP cap limits owner deferral to ~${pct(allowedPct)} of comp (NHCE ADP ${pct(nhceAvgDef)})` : `NHCE ADP ${pct(nhceAvgDef)} supports full owner deferral`,
+        pros: ["Employer match and profit sharing fully discretionary", "Vesting schedules on employer money aid retention", "Scales to any headcount", "Roth and loans available"],
+        cons: ["ADP/ACP testing every year; failures mean HCE refunds or QNECs ($15K-$40K typical)", "Owner deferral is hostage to rank-and-file participation", "Top-heavy minimums (3%) if key employees hold >60% of assets", "Highest admin cost without the testing exemption"],
+        best: "Broad participation, balanced demographics, employer wants discretion",
+      });
+    }
+
+    // Safe Harbor 401(k)
+    {
+      const ownerDef = Math.min(L.deferral, selfEmployed ? seBase(s.ownerComp) : comp);
+      const shRate = s.shType === "ne" ? 0.03 : 0.04;
+      const ownerER = s.shType === "ne" ? ownerEmployerAt(0.03) : Math.min(ownerEmployerAt(0.04), ownerDef);
+      const eeCost = s.shType === "ne" ? payroll * 0.03 : payroll * part * Math.min(0.04, avgDef <= 0.03 ? avgDef : 0.03 + (avgDef - 0.03) * 0.5);
+      const a = adminMid("sh");
+      const credit = startupCredit("sh", ees, avgComp, ees ? eeCost / ees : 0, a.mid);
+      const newPlanDays = daysUntil(new Date(2026, 9, 1));
+      const dec1 = daysUntil(new Date(2026, 11, 1));
+      plans.push({
+        id: "sh", eligible: true,
+        ownerDeferral: ownerDef, ownerER, ownerCatch: cu, ownerTotal: ownerDef + ownerER + cu,
+        household: ownerDef + ownerER + cu + (s.spouse ? spouseDef + (s.shType === "ne" ? spouseER(0.03) : Math.min(spouseER(0.04), spouseDef)) : 0),
+        eeCost, eeRate: payroll ? eeCost / payroll : 0, a, credit,
+        maOwner: ownerMAAllowed,
+        deadline: s.shType === "ne" ? "New plan: first plan year of 3+ months (start by Oct 1); existing 401(k): 4% nonelective amendment by Dec 1" : "New plan year must start by Oct 1, 2026 (3-month rule)",
+        deadlineDays: s.shType === "ne" ? dec1 : newPlanDays,
+        note: `${s.shType === "ne" ? "3% nonelective to all eligible" : "Basic match: 100% of first 3% + 50% of next 2%"}; safe harbor money is 100% vested`,
+        pros: ["Owner and HCEs defer the full $24,500 regardless of participation", "No ADP/ACP testing; top-heavy exempt if only SH contributions", "Predictable, budgetable employer cost", "Mid-year 4% nonelective fallback rescues a late start"],
+        cons: ["Mandatory employer contribution, immediately vested", "Notice and amendment timing rules are unforgiving", "3% nonelective goes to non-participants too", "Full Form 5500 and recordkeeping like any 401(k)"],
+        best: "2-100 employees where the owner wants full deferrals without testing risk",
+      });
+    }
+
+    // SH 401(k) + cross-tested profit sharing
+    {
+      const ownerDef = Math.min(L.deferral, selfEmployed ? seBase(s.ownerComp) : comp);
+      const erMax = ownerEmployerAt(0.25);
+      const ownerER = Math.max(0, Math.min(erMax, L.c415 - ownerDef)); // includes the 3% SH nonelective
+      const ownerERpct = ownerER / Math.max(comp, 1);
+      // Gateway: NHCEs receive the lesser of 5% of comp or one-third of the highest HCE rate; 3% SH counts toward it
+      const gateway = Math.min(0.05, Math.max(0.03, ownerERpct / 3));
+      const eeRate = Math.max(0.03, gateway);
+      const eeCost = payroll * eeRate;
+      const a = adminMid("shps");
+      const credit = startupCredit("shps", ees, avgComp, ees ? eeCost / ees : 0, a.mid);
+      plans.push({
+        id: "shps", eligible: true,
+        ownerDeferral: ownerDef, ownerER, ownerCatch: cu, ownerTotal: ownerDef + ownerER + cu,
+        household: ownerDef + ownerER + cu + (s.spouse ? Math.min(L.c415, spouseDef + spouseER(0.25)) : 0),
+        eeCost, eeRate, a, credit,
+        maOwner: ownerMAAllowed, deadline: "Plan year start by Oct 1, 2026 (new SH plan); PS allocation decided after year-end", deadlineDays: daysUntil(new Date(2026, 9, 1)),
+        note: `Employees at ~${pct(eeRate)} (3% SH + gateway); owner employer side ${pct(ownerERpct)} of comp. TPA general test required`,
+        pros: ["Owner reaches the full $72,000 while employees receive ~5-7.5%", "SH satisfies ADP/ACP; PS can carry a vesting schedule", "New comparability skews to owners and older HCEs", "Foundation for a later cash balance layer"],
+        cons: ["Cross-testing adds $500-$1,500 TPA cost and annual general-test risk", "Employee allocations are effectively mandatory once the owner takes 25%", "Demographics matter: young owner / older staff fails the test", "Most complex DC design short of a DB plan"],
+        best: "11-50 employees; profitable owner wants the $72K maximum at controlled employee cost",
+      });
+    }
+
+    // 401(k) + Cash Balance
+    {
+      const eligibleAge = s.ownerAge >= 40;
+      const eligible = s.stableProfit;
+      const ownerDef = Math.min(L.deferral, selfEmployed ? seBase(s.ownerComp) : comp);
+      const dcER = ownerEmployerAt(0.06); // s.404(a)(7): DC employer side held to 6% when a non-PBGC DB is maintained
+      const cb = cbEstimate(s.ownerAge, selfEmployed ? seBase(s.ownerComp) : comp);
+      const ownerTotal = ownerDef + dcER + cb + cu;
+      const eeRate = 0.075 + 0.015; // 7.5% DC gateway (combined-plan) + illustrative 1.5% CB pay credit
+      const eeCost = payroll * eeRate;
+      const a = adminMid("cb");
+      const credit = startupCredit("cb", ees, avgComp, ees ? (payroll * 0.075) / ees : 0, a.mid);
+      plans.push({
+        id: "cb", eligible, reason: !eligible ? "Variable profits: DB funding is a legal obligation, not discretionary" : null,
+        ownerDeferral: ownerDef, ownerER: dcER + cb, ownerCatch: cu, ownerTotal, cbPortion: cb,
+        household: ownerTotal + (s.spouse ? Math.min(L.c415, spouseDef + spouseER(0.06)) + cbEstimate(s.ownerAge, Math.min(s.spouseComp, L.compCap)) * 0.6 : 0),
+        eeCost, eeRate, a, credit,
+        maOwner: ownerMAAllowed, deadline: "Adopt by Dec 31, 2026 in practice (SECURE Act s.201 permits adoption to filing deadline); actuary needed now", deadlineDays: daysUntil(new Date(2026, 11, 31)),
+        note: `CB credit ~${fmt(cb)} at age ${s.ownerAge} is illustrative; actuary sets the actual figure${!eligibleAge ? ". Below age 45 the math rarely justifies the cost" : ""}`,
+        pros: ["Only route to $150K-$300K+ of annual deductible shelter", "Deduction lands against the highest marginal dollars (surtax filers especially)", "Strong retention and exit-planning tool", "Layers on an existing 401(k)/PS"],
+        cons: ["Annual funding obligation regardless of profits; underfunding triggers excise tax and Form 5330", "Actuary, Schedule SB, highest admin cost", "3-5 year commitment horizon; employees typically receive 7.5%+", "MA estate inclusion grows; $2M cliff and no portability"],
+        best: "Owner 45+, stable profits, wants to shelter well beyond $72K",
+      });
+    }
+
+    // Tax value and net cost
+    plans.forEach((p) => {
+      p.ownerTaxSaved = p.ownerTotal * ownerTaxRate;
+      p.eeNet = p.eeCost * (1 - entityTaxRate);
+      p.adminNet = p.a.mid * (1 - entityTaxRate);
+      p.creditTotal = s.newPlan ? p.credit.admin + p.credit.contrib : 0;
+      p.year1 = p.eeCost + p.a.mid + p.a.setup - p.creditTotal;
+      p.year1Net = p.year1 - (p.eeCost + p.a.mid + p.a.setup) * entityTaxRate;
+    });
+
+    // Scoring
+    const elig = plans.filter((p) => p.eligible);
+    const maxShelter = Math.max(...elig.map((p) => p.ownerTotal), 1);
+    const maxCost = Math.max(...elig.map((p) => p.year1), 1);
+    const W = { shelter: s.wShelter, cost: s.wCost, simplicity: s.wSimplicity, recruit: s.wRecruit, flex: s.wFlex };
+    const wSum = Object.values(W).reduce((a, b) => a + b, 0) || 1;
+    plans.forEach((p) => {
+      const st = STATIC[p.id];
+      p.scores = {
+        shelter: 10 * (p.ownerTotal / maxShelter),
+        cost: 10 * (1 - p.year1 / maxCost),
+        simplicity: st.simplicity,
+        recruit: ees === 0 ? 5 : st.recruiting,
+        flex: st.flexibility,
+      };
+      if (p.id === "trad" && p.testingRisk === "High") p.scores.shelter *= 0.85;
+      p.score = p.eligible ? (p.scores.shelter * W.shelter + p.scores.cost * W.cost + p.scores.simplicity * W.simplicity + p.scores.recruit * W.recruit + p.scores.flex * W.flex) / wSum : 0;
+    });
+    const ranked = [...plans].sort((a, b) => b.score - a.score);
+    const top = ranked.find((p) => p.eligible);
+
+    // Flags
+    const flags = [];
+    if (selfEmployed && s.ma) flags.push({ tag: "MA", text: "Massachusetts denies the deduction for a self-employed owner's contributions (G.L. c. 62 s.2(d)(1)(D); DOR Directive 08-3). Owner shelter above is federal-only; track MA basis in the permanent file. Converting to an S-Corp makes the owner's contribution MA-deductible - worth ~" + fmt(Math.min(L.c415, top?.ownerTotal || 0) * maRate) + "/yr at this comp." });
+    if (rothCatchApplies) flags.push({ tag: "NEW", text: "Roth catch-up mandate (SECURE 2.0 s.603): prior-year FICA wages above $150,000 and age 50+ means all 2026 catch-up must be Roth. Confirm the plan document permits Roth before the first catch-up." });
+    if (s.related) flags.push({ tag: "FLAG", text: "Related entities: controlled/affiliated service group rules aggregate employees for coverage and share one $72,000 s.415(c) limit. Senior review before any multi-entity design." });
+    if (ees > 0 && ees <= 100 && daysUntil(new Date(2026, 9, 1)) > 0) flags.push({ tag: "DEADLINE", text: `SIMPLE IRA and a new safe harbor 401(k) for 2026 both need to be in place by Oct 1, 2026 - ${daysUntil(new Date(2026, 9, 1))} days out. Miss it and the 2026 options narrow to SEP, a traditional 401(k), or a mid-year 4% nonelective safe harbor on an existing plan.` });
+    if (s.entity === "scorp" && s.ownerComp < 190000 && ees === 0) flags.push({ tag: "FLAG", text: `W-2 of ${fmt(s.ownerComp)} caps the employer side at ${fmt(s.ownerComp * 0.25)}. $190,000 of W-2 unlocks the full $72,000 Solo 401(k); $288,000 for a full SEP. Weigh the extra FICA against the added shelter.` });
+    if (ees > 0 && ees <= 50 && s.newPlan) flags.push({ tag: "CREDIT", text: "Startup credit (s.45E): up to 100% of admin cost (max $5,000/yr for 3 years) plus up to $1,000 per employee earning $100K or less on employer contributions. Year-1 net cost below reflects it." });
+    if (s.spouse) flags.push({ tag: "FLAG", text: "Spousal compensation must be defensible - keep a written role description or timesheets. Household capacity assumes the spouse is a bona fide W-2 employee." });
+    if (ees > 0 && avgComp > 0 && avgComp < L.sepMinComp * 10) flags.push({ tag: "NOTE", text: "Low average employee comp: check SEP ($800) and SIMPLE ($5,000 in two prior years) eligibility thresholds - part-timers may be excludable." });
+    if (ees >= 100) flags.push({ tag: "NOTE", text: "100+ participants triggers the Form 5500 audit requirement; budget $8K-$15K additional." });
+
+    return { plans, ranked, top, flags, selfEmployed, ownerTaxRate, entityTaxRate, ownerMAAllowed, nhceAvgDef, rothCatchApplies, participants };
+  }, [s]);
+
+  const field = (label, k, opts = {}) => (
+    <label className="block text-sm">
+      <span className="text-gray-700">{label}</span>
+      <input type="number" value={s[k]} onChange={u(k)} step={opts.step || 1} min={0}
+        className="mt-1 w-full rounded border px-2 py-1 text-right" style={{ borderColor: BRAND.rule, color: "#1F4E9C", fontWeight: 600 }} />
+    </label>
+  );
+  const slider = (label, k) => (
+    <label className="block text-sm">
+      <div className="flex justify-between"><span className="text-gray-700">{label}</span><span className="tabular-nums" style={{ color: BRAND.burgundy }}>{s[k]}</span></div>
+      <input type="range" min={0} max={5} value={s[k]} onChange={u(k)} className="w-full" style={{ accentColor: BRAND.orange }} />
+    </label>
+  );
+  const check = (label, k) => (
+    <label className="flex items-center gap-2 text-sm text-gray-700"><input type="checkbox" checked={s[k]} onChange={u(k)} style={{ accentColor: BRAND.burgundy }} />{label}</label>
+  );
+
+  const Tag = ({ t }) => {
+    const c = { MA: "#1F4E9C", NEW: BRAND.orange, FLAG: BRAND.burgundy, DEADLINE: "#B3261E", CREDIT: "#2E7D32", NOTE: "#6B6B6B" }[t] || "#6B6B6B";
+    return <span className="inline-block rounded px-1.5 py-0.5 text-xs font-semibold text-white mr-2 align-middle" style={{ background: c }}>[{t}]</span>;
+  };
+
+  const row = (label, fn, opts = {}) => (
+    <tr className="border-t" style={{ borderColor: BRAND.rule }}>
+      <td className="py-2 pr-3 text-gray-700 whitespace-nowrap sticky left-0" style={{ background: opts.shade ? BRAND.soft : "white" }}>{label}</td>
+      {R.plans.map((p) => (
+        <td key={p.id} className={`py-2 px-2 text-sm ${opts.num ? "text-right tabular-nums" : ""} ${!p.eligible ? "text-gray-400" : ""}`}
+          style={{ background: p.id === R.top?.id ? "#FFF4E8" : opts.shade ? BRAND.soft : "white" }}>
+          {fn(p)}
+        </td>
+      ))}
+    </tr>
+  );
+
+  return (
+    <div className="min-h-screen" style={{ background: BRAND.paper, color: BRAND.ink, fontFamily: "Arial, Helvetica, sans-serif" }}>
+      <header className="px-6 py-5" style={{ background: BRAND.burgundy, color: "white" }}>
+        <div className="max-w-7xl mx-auto flex flex-wrap items-baseline justify-between gap-2">
+          <div>
+            <h1 className="text-2xl" style={{ fontFamily: "Georgia, serif" }}>Employer Retirement Plan Optimizer</h1>
+            <p className="text-sm opacity-90">McConnell, Rothman &amp; Co., P.C. - Plan selection decision framework, 2026 limits</p>
+          </div>
+          <div className="text-xs opacity-80">v1.0 - built on Employer Retirement Plan Guide v3.0 - Notice 2025-67</div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-6 py-6 grid gap-6 lg:grid-cols-[320px_1fr]">
+        {/* Inputs */}
+        <aside className="space-y-5">
+          <section className="rounded-lg border p-4 space-y-3" style={{ borderColor: BRAND.rule, background: "white" }}>
+            <h2 className="text-lg" style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy }}>Business profile</h2>
+            <label className="block text-sm">
+              <span className="text-gray-700">Entity classification</span>
+              <select value={s.entity} onChange={u("entity")} className="mt-1 w-full rounded border px-2 py-1" style={{ borderColor: BRAND.rule }}>
+                <option value="sp">Sole proprietor / SMLLC</option>
+                <option value="partnership">Partnership / multi-member LLC</option>
+                <option value="scorp">S corporation</option>
+                <option value="ccorp">C corporation</option>
+              </select>
+            </label>
+            {field(R.selfEmployed ? "Owner net SE profit (Sch. C / K-1 14A)" : "Owner W-2 wages", "ownerComp", { step: 5000 })}
+            {field("Owner age at 12/31/2026", "ownerAge")}
+            {!R.selfEmployed && field("Owner 2025 Box 3 FICA wages", "priorFicaWages", { step: 5000 })}
+            {field("Non-owner eligible employees", "employees")}
+            {s.employees > 0 && field("Their total eligible payroll", "eePayroll", { step: 10000 })}
+            {s.employees > 0 && field("Expected participation rate (%)", "participation")}
+            {s.employees > 0 && field("Avg deferral of participants (% of pay)", "avgDeferral", { step: 0.5 })}
+            {check("Spouse is a bona fide W-2 employee", "spouse")}
+            {s.spouse && field("Spouse W-2 wages", "spouseComp", { step: 5000 })}
+            {check("Profits stable enough for a funding obligation", "stableProfit")}
+            {check("Owner has other related businesses", "related")}
+            {check("New plan (no existing plan in last 3 years)", "newPlan")}
+          </section>
+
+          <section className="rounded-lg border p-4 space-y-3" style={{ borderColor: BRAND.rule, background: "white" }}>
+            <h2 className="text-lg" style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy }}>Tax position</h2>
+            {field("Owner federal marginal rate (%)", "fedRate")}
+            {check("Massachusetts resident / MA entity", "ma")}
+            {s.ma && check("Owner above the 4% surtax threshold ($1,107,750)", "surtax")}
+            <label className="block text-sm">
+              <span className="text-gray-700">Traditional 401(k) match</span>
+              <select value={s.tradMatch} onChange={u("tradMatch")} className="mt-1 w-full rounded border px-2 py-1" style={{ borderColor: BRAND.rule }}>
+                <option value="none">No match</option>
+                <option value="basic">50% of first 6%</option>
+                <option value="dollar">100% of first 3%</option>
+              </select>
+            </label>
+            <label className="block text-sm">
+              <span className="text-gray-700">Safe harbor formula</span>
+              <select value={s.shType} onChange={u("shType")} className="mt-1 w-full rounded border px-2 py-1" style={{ borderColor: BRAND.rule }}>
+                <option value="ne">3% nonelective to all eligible</option>
+                <option value="match">Basic match (100%/3% + 50%/2%)</option>
+              </select>
+            </label>
+          </section>
+
+          <section className="rounded-lg border p-4 space-y-3" style={{ borderColor: BRAND.rule, background: "white" }}>
+            <h2 className="text-lg" style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy }}>Client priorities</h2>
+            <p className="text-xs text-gray-500">Weight each objective 0-5. These drive the ranking, not the dollar figures.</p>
+            {slider("Owner tax shelter", "wShelter")}
+            {slider("Minimize employer cost", "wCost")}
+            {slider("Administrative simplicity", "wSimplicity")}
+            {slider("Recruiting and retention", "wRecruit")}
+            {slider("Funding flexibility", "wFlex")}
+          </section>
+        </aside>
+
+        {/* Results */}
+        <div className="space-y-6 min-w-0">
+          {/* Recommendation */}
+          {R.top && (
+            <section className="rounded-lg border-l-4 p-5" style={{ borderColor: BRAND.orange, background: "white" }}>
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <h2 className="text-xl" style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy }}>Recommended starting point: {NAMES[R.top.id]}</h2>
+                <span className="text-sm text-gray-500">Weighted score {R.top.score.toFixed(1)} / 10</span>
+              </div>
+              <div className="grid sm:grid-cols-4 gap-4 mt-4">
+                <Stat label="Owner 2026 capacity" value={fmt(R.top.ownerTotal)} sub={R.top.ownerCatch ? `incl. ${fmt(R.top.ownerCatch)} catch-up` : "no catch-up (under 50)"} />
+                <Stat label="Owner tax saved" value={fmt(R.top.ownerTaxSaved)} sub={`${(R.ownerTaxRate * 100).toFixed(0)}% combined${R.ownerMAAllowed ? "" : " (federal only - MA denied)"}`} />
+                <Stat label="Employer cost to staff" value={fmt(R.top.eeCost)} sub={s.employees ? `${pct(R.top.eeRate)} of ${fmt(s.eePayroll)} payroll` : "no employees"} />
+                <Stat label="Year-1 net cost" value={fmt(R.top.year1Net)} sub={`after ${fmt(R.top.creditTotal)} credit and ${(R.entityTaxRate * 100).toFixed(0)}% deduction`} />
+              </div>
+              <p className="mt-4 text-sm text-gray-700">{R.top.best}. {R.top.note}.</p>
+              <p className="mt-2 text-sm text-gray-700">
+                Runner-up: <strong>{NAMES[R.ranked.filter((p) => p.eligible)[1]?.id]}</strong> at {R.ranked.filter((p) => p.eligible)[1]?.score.toFixed(1)}.
+                {" "}The best plan is the one the owner will actually fund - a $500 SIMPLE that gets funded beats a $15,000 401(k) that sits dormant.
+              </p>
+            </section>
+          )}
+
+          {/* Flags */}
+          {R.flags.length > 0 && (
+            <section className="rounded-lg border p-4" style={{ borderColor: BRAND.rule, background: "white" }}>
+              <h3 className="text-base mb-2" style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy }}>Flags for this fact pattern</h3>
+              <ul className="space-y-2 text-sm">
+                {R.flags.map((f, i) => <li key={i}><Tag t={f.tag} />{f.text}</li>)}
+              </ul>
+            </section>
+          )}
+
+          {/* Comparison table */}
+          <section className="rounded-lg border p-4 overflow-x-auto" style={{ borderColor: BRAND.rule, background: "white" }}>
+            <h3 className="text-base mb-3" style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy }}>Side-by-side comparison (2026)</h3>
+            <table className="w-full text-sm border-collapse">
+              <thead>
+                <tr>
+                  <th className="text-left py-2 pr-3 sticky left-0 bg-white font-normal text-gray-500">Greyed columns are not available on these facts</th>
+                  {R.plans.map((p) => (
+                    <th key={p.id} className="text-left py-2 px-2 align-bottom" style={{ background: p.id === R.top?.id ? "#FFF4E8" : "white", color: p.eligible ? BRAND.burgundy : "#9CA3AF", fontFamily: "Georgia, serif", fontWeight: 600, minWidth: 140 }}>
+                      {NAMES[p.id]}
+                      {p.id === R.top?.id && <div className="text-xs font-normal" style={{ color: BRAND.orange }}>Recommended</div>}
+                      {!p.eligible && <div className="text-xs font-normal">{p.reason}</div>}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {row("Weighted score", (p) => p.eligible ? p.score.toFixed(1) : "-", { num: true, shade: true })}
+                {row("Owner total 2026", (p) => <strong>{fmt(p.ownerTotal)}</strong>, { num: true })}
+                {row("  Elective deferral", (p) => fmt(p.ownerDeferral), { num: true })}
+                {row("  Employer side", (p) => p.id === "cb" ? `${fmt(p.ownerER)} (CB ${fmt(p.cbPortion)})` : fmt(p.ownerER), { num: true })}
+                {row("  Catch-up", (p) => fmt(p.ownerCatch), { num: true })}
+                {s.spouse && row("Household total (w/ spouse)", (p) => fmt(p.household), { num: true })}
+                {row("Owner tax saved", (p) => fmt(p.ownerTaxSaved), { num: true, shade: true })}
+                {row("Required employer $ to staff", (p) => fmt(p.eeCost), { num: true })}
+                {row("  As % of staff payroll", (p) => pct(p.eeRate), { num: true })}
+                {row("Est. annual admin (low-high)", (p) => `${fmt(p.a.low)} - ${fmt(p.a.high)}`, { num: true })}
+                {row("Est. setup", (p) => fmt(p.a.setup), { num: true })}
+                {row("Year-1 startup credit", (p) => fmt(p.creditTotal), { num: true })}
+                {row("Year-1 employer cost, pre-tax", (p) => fmt(p.year1), { num: true, shade: true })}
+                {row("Year-1 employer cost, after deduction", (p) => <strong>{fmt(p.year1Net)}</strong>, { num: true, shade: true })}
+                {row("Nondiscrimination testing", (p) => STATIC[p.id].testing + (p.testingRisk && p.testingRisk !== "n/a" ? ` - risk ${p.testingRisk}` : ""))}
+                {row("Form 5500", (p) => STATIC[p.id].form5500)}
+                {row("Owner contribution MA-deductible", (p) => p.maOwner ? "Yes" : "No (self-employed)")}
+                {row("Roth / loans", (p) => `${STATIC[p.id].roth} / ${STATIC[p.id].loans}`)}
+                {row("Deadline for a 2026 plan", (p) => <span>{p.deadline}{p.deadlineDays != null && p.deadlineDays > 0 && p.deadlineDays < 120 ? <span className="ml-1 font-semibold" style={{ color: "#B3261E" }}>({p.deadlineDays} days)</span> : null}</span>)}
+              </tbody>
+            </table>
+            <p className="text-xs text-gray-500 mt-3">
+              Owner employer-side figures for self-employed owners use the Pub. 560 circular calculation (net profit less one-half SE tax, then rate / (1 + rate)). Admin ranges are the guide's 2026 estimates plus per-participant fees for {R.participants} participants. Cash balance credit is illustrative by age; an actuary sets the actual figure.
+            </p>
+          </section>
+
+          {/* Score breakdown */}
+          <section className="rounded-lg border p-4 overflow-x-auto" style={{ borderColor: BRAND.rule, background: "white" }}>
+            <h3 className="text-base mb-3" style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy }}>How the ranking was built</h3>
+            <table className="w-full text-sm border-collapse">
+              <thead><tr className="text-gray-500"><th className="text-left py-1 pr-3 font-normal">Criterion (weight)</th>{R.plans.map((p) => <th key={p.id} className="text-right py-1 px-2 font-normal">{NAMES[p.id].replace(" 401(k)", "").replace("Traditional", "Trad.").replace(" + Cross-Tested PS", " + PS")}</th>)}</tr></thead>
+              <tbody>
+                {[["shelter", "Owner shelter", s.wShelter], ["cost", "Low employer cost", s.wCost], ["simplicity", "Simplicity", s.wSimplicity], ["recruit", "Recruiting", s.wRecruit], ["flex", "Flexibility", s.wFlex]].map(([k, label, w]) => (
+                  <tr key={k} className="border-t" style={{ borderColor: BRAND.rule }}>
+                    <td className="py-1 pr-3 text-gray-700">{label} ({w})</td>
+                    {R.plans.map((p) => <td key={p.id} className="py-1 px-2 text-right tabular-nums" style={{ color: p.eligible ? BRAND.ink : "#9CA3AF" }}><Bar v={p.scores[k]} /></td>)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="text-xs text-gray-500 mt-2">Shelter and cost scores are relative to the best eligible plan on these facts; simplicity, recruiting, and flexibility are fixed plan attributes from the guide. Ineligible plans score zero.</p>
+          </section>
+
+          {/* Pros / cons */}
+          <section>
+            <h3 className="text-base mb-3" style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy }}>Plan profiles - pros, cons, and best fit</h3>
+            <div className="grid md:grid-cols-2 gap-3">
+              {R.ranked.map((p) => (
+                <div key={p.id} className="rounded-lg border" style={{ borderColor: p.id === R.top?.id ? BRAND.orange : BRAND.rule, background: "white", opacity: p.eligible ? 1 : 0.6 }}>
+                  <button onClick={() => setOpen(open === p.id ? null : p.id)} className="w-full text-left px-4 py-3 flex justify-between items-center">
+                    <span style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy, fontWeight: 600 }}>{NAMES[p.id]}</span>
+                    <span className="text-sm text-gray-500">{p.eligible ? `${fmt(p.ownerTotal)} owner / ${fmt(p.year1Net)} net cost` : "Not available"}</span>
+                  </button>
+                  {open === p.id && (
+                    <div className="px-4 pb-4 text-sm space-y-3">
+                      <p className="text-gray-700"><strong>Best fit:</strong> {p.best}</p>
+                      <div className="grid sm:grid-cols-2 gap-3">
+                        <div><div className="font-semibold mb-1" style={{ color: "#2E7D32" }}>Pros</div><ul className="list-disc pl-4 space-y-1 text-gray-700">{p.pros.map((x, i) => <li key={i}>{x}</li>)}</ul></div>
+                        <div><div className="font-semibold mb-1" style={{ color: "#B3261E" }}>Cons</div><ul className="list-disc pl-4 space-y-1 text-gray-700">{p.cons.map((x, i) => <li key={i}>{x}</li>)}</ul></div>
+                      </div>
+                      <p className="text-gray-600">{p.note}.</p>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </section>
+
+          {/* Assumptions */}
+          <section className="rounded-lg border p-4 text-xs text-gray-600 space-y-2" style={{ borderColor: BRAND.rule, background: "white" }}>
+            <h3 className="text-base" style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy }}>Assumptions, authority, and limits of this model</h3>
+            <p><strong>2026 figures:</strong> deferral $24,500; catch-up $8,000 / $11,250 (60-63); s.415(c) $72,000; SIMPLE $17,000 with $4,000 / $5,250 catch-up; comp cap $360,000; SS wage base $184,500; SEP eligibility $800; Roth catch-up wage test $150,000 (prior-year FICA). Source: IRS Notice 2025-67 and IR-2025-111.</p>
+            <p><strong>Employer cost modeling:</strong> SIMPLE and 401(k) match costs assume the stated participation rate and average deferral; nonelective formulas apply to all eligible payroll. Cross-tested gateway modeled at the lesser of 5% or one-third of the owner's employer rate (minimum 3% SH). Combined DB/DC design assumes a 7.5% DC gateway plus an illustrative 1.5% CB pay credit for staff and holds the owner's DC employer side to 6% (s.404(a)(7)).</p>
+            <p><strong>Startup credit:</strong> s.45E as amended by SECURE 2.0; admin credit 100% up to $5,000 for 50 or fewer employees (50% for 51-100), contribution credit up to $1,000 per employee earning $100,000 or less, year-1 rate. Requires at least one NHCE. DB contributions do not qualify for the contribution credit.</p>
+            <p><strong>Massachusetts:</strong> owner contributions are treated as non-deductible for sole proprietors, SMLLC owners, and partners (G.L. c. 62 s.2(d)(1)(D); DOR Directives 08-3 and 99-7) and deductible for S-Corp / C-Corp owner-employees and all common-law employees. C-Corp entity deduction modeled at 21% federal plus 8% MA corporate excise.</p>
+            <p><strong>Not modeled:</strong> top-heavy minimums under a traditional 401(k), s.199A QBI reduction for self-employed owners (a pre-tax contribution is worth roughly 80% of face below the threshold), FICA cost of raising S-Corp wages, PTET interaction, MA estate inclusion, LTPT employee eligibility, and controlled-group aggregation. Treat output as a screening tool; final design requires TPA modeling and, for any multi-entity or spousal-business client, senior review.</p>
+            <p><strong>Changelog:</strong> v1.0 (Sep 2026) - initial release from Guide v3.0. Update the L constants and COST table when Notice 2026-xx publishes 2027 limits.</p>
+            <p className="pt-1" style={{ color: BRAND.burgundy }}>Confidential - for professional reference only - not tax or legal advice.</p>
+          </section>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function Stat({ label, value, sub }) {
+  return (
+    <div>
+      <div className="text-xs text-gray-500">{label}</div>
+      <div className="text-2xl tabular-nums" style={{ fontFamily: "Georgia, serif", color: BRAND.burgundy }}>{value}</div>
+      <div className="text-xs text-gray-500">{sub}</div>
+    </div>
+  );
+}
+
+function Bar({ v }) {
+  const w = Math.max(0, Math.min(10, v)) * 10;
+  return (
+    <div className="flex items-center justify-end gap-2">
+      <div className="h-2 w-16 rounded bg-gray-100 overflow-hidden"><div className="h-2" style={{ width: `${w}%`, background: BRAND.orange }} /></div>
+      <span className="w-6 text-right">{v.toFixed(1)}</span>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<RetirementPlanOptimizer />);
+  </script>
+</body>
+</html>
